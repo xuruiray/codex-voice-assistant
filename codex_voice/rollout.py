@@ -109,8 +109,9 @@ class RolloutWatcher:
                         )
                         source = p.get("source", "")
                         current["subagent"] = (
-                            isinstance(source, dict) and "subAgent" in source
-                        )
+                            isinstance(source, dict)
+                            and bool({"subAgent", "subagent"} & source.keys())
+                        ) or p.get("thread_source") == "subagent"
                         current["source"] = "rollout"
                 except (ValueError, TypeError, KeyError):
                     return 0

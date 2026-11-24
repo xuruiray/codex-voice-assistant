@@ -10,11 +10,13 @@ import plistlib
 import subprocess
 import sys
 import time
+import shutil
 from pathlib import Path
 
-from .config import DEFAULTS, atomic_json, load, secrets
+from .config import DEFAULTS, atomic_json, load, secrets, update_settings
 from .daemon import DaemonWatcher
-from .harness import Harness, prepare_profile
+from .harness import prepare_profile
+from .composer import create_composer
 from .service import run
 from .speech import VolcTTS
 from .store import Store
@@ -26,7 +28,7 @@ def print_json(value):
 
 def configure(cfg, args):
     path = Path(cfg["config_path"])
-    settings = {k: cfg[k] for k in DEFAULTS}
+    settings = {}
     if args.api_key:
         credential_file = Path(cfg["secrets_path"])
         data = (
@@ -48,14 +50,21 @@ def configure(cfg, args):
         data["deepseek_api_key"] = value
         atomic_json(Path(cfg["secrets_path"]), data)
         settings["deepseek_provider"] = "deepseek-official"
+        settings["text_provider"] = "deepseek"
     if args.account:
         settings["deepseek_provider"] = "deepseek-account"
+        settings["text_provider"] = "deepseek"
+    if args.provider:
+        settings["text_provider"] = args.provider
+    if args.codex_model is not None:
+        settings["codex_model"] = args.codex_model
     if args.speaker:
         settings["speaker"] = args.speaker
     if args.resource:
         settings["tts_resource_id"] = args.resource
-    atomic_json(path, settings)
-    prepare_profile(load(path))
+    update_settings(path, settings)
+    if load(path)["text_provider"] == "deepseek":
+        prepare_profile(load(path))
     print("配置已保存。后台服务会在下一轮读取。")
 
 
@@ -63,7 +72,20 @@ def doctor(cfg):
     store = Store(Path(cfg["state_dir"]) / "state.sqlite")
     daemon = DaemonWatcher(store, cfg)
     daemon.poll()
+    login = "unavailable"
+    try:
+        env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")}
+        env["CODEX_HOME"] = cfg["codex_login_home"] or cfg["codex_home"]
+        check = subprocess.run([cfg["codex_command"], "login", "status"], env=env,
+                               capture_output=True, timeout=10)
+        status = (check.stdout + check.stderr).decode(errors="replace").lower()
+        login = "chatgpt" if check.returncode == 0 and "chatgpt" in status else "not_chatgpt"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     result = {
+        "text_provider": cfg["text_provider"],
+        "codex_installed": bool(shutil.which(cfg["codex_command"])),
+        "codex_login": login,
         "dsh_installed": Path(cfg["dsh_command"]).exists(),
         "dsh_provider": cfg["deepseek_provider"],
         "dsh_profile": cfg["dsh_profile"],
@@ -103,7 +125,7 @@ def test_notification(cfg, no_play=False, tts_only=False):
     text = (
         f"{cfg['call_name']}，Codex 语音助理正在测试，现在可以听到提醒了。"
         if tts_only
-        else Harness(cfg).compose([event])
+        else create_composer(cfg).compose([event])
     )
     path = Path(cfg["state_dir"]) / "test-notification.mp3"
     try:
@@ -113,7 +135,7 @@ def test_notification(cfg, no_play=False, tts_only=False):
             tts.play(path)
         print_json(
             {
-                "model": "skipped" if tts_only else "DeepSeek Harness",
+                "model": "skipped" if tts_only else cfg["text_provider"],
                 "tts": "ok",
                 "playback": "skipped" if no_play else "afplay exited successfully",
                 "text": text,
@@ -126,7 +148,8 @@ def test_notification(cfg, no_play=False, tts_only=False):
 
 def install_service(cfg):
     label = cfg["service_label"]
-    prepare_profile(cfg)
+    if cfg["text_provider"] == "deepseek":
+        prepare_profile(cfg)
     if not Path(cfg["config_path"]).exists():
         atomic_json(Path(cfg["config_path"]), {k: cfg[k] for k in DEFAULTS})
     state = Path(cfg["state_dir"])
@@ -202,11 +225,13 @@ def main():
     p.add_argument("--api-key", action="store_true")
     p.add_argument("--deepseek-key", action="store_true")
     p.add_argument("--account", action="store_true")
+    p.add_argument("--provider", choices=("codex", "deepseek"))
+    p.add_argument("--codex-model", help="留空跟随本机 Codex 配置的模型")
     p.add_argument("--speaker")
     p.add_argument("--resource")
     p = sub.add_parser("run", help="前台运行监听程序")
     p.add_argument("--observe-only", action="store_true")
-    p = sub.add_parser("test", help="真实 DS → 火山 TTS → 本机播放测试")
+    p = sub.add_parser("test", help="真实文案生成 → 火山 TTS → 本机播放测试")
     p.add_argument("--no-play", action="store_true")
     p.add_argument("--tts-only", action="store_true")
     sub.add_parser("status", help="查看服务健康状态")
@@ -216,11 +241,22 @@ def main():
     sub.add_parser("resume", help="恢复语音")
     sub.add_parser("install-service", help="安装并启动用户级 launchd 服务")
     sub.add_parser("uninstall-service", help="停止后台服务，保留配置和记录")
+    sub.add_parser("ui", help="打开配置界面")
+    sub.add_parser("install-ui", help="安装原生菜单栏和配置窗口")
     args = parser.parse_args()
     try:
         cfg = load(args.config)
         if args.command == "doctor":
             doctor(cfg)
+        elif args.command == "install-ui":
+            from .desktop import install
+
+            install(cfg)
+            print("菜单栏与设置窗口已安装。")
+        elif args.command == "ui":
+            from .desktop import open_settings
+
+            open_settings(cfg)
         elif args.command == "configure":
             configure(cfg, args)
         elif args.command == "test":
@@ -249,9 +285,9 @@ def main():
             ).unlink(missing_ok=True)
             print("后台服务已移除，配置和记录已保留。")
         elif args.command in ("pause", "resume"):
-            settings = {k: cfg[k] for k in DEFAULTS}
-            settings["enabled"] = args.command == "resume"
-            atomic_json(Path(cfg["config_path"]), settings)
+            update_settings(
+                Path(cfg["config_path"]), {"enabled": args.command == "resume"}
+            )
             print("语音已暂停。" if args.command == "pause" else "语音已恢复。")
         elif args.command == "status":
             path = Path(cfg["state_dir"]) / "health.json"
@@ -279,9 +315,10 @@ def main():
     except Exception as exc:
         # Provider bodies and configuration values must never leak through the CLI.
         from .harness import HarnessFailure
+        from .codex import CodexFailure
         from .speech import TTSFailure
 
-        if isinstance(exc, (HarnessFailure, TTSFailure)):
+        if isinstance(exc, (HarnessFailure, CodexFailure, TTSFailure)):
             print(str(exc), file=sys.stderr)
         else:
             print(

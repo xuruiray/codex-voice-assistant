@@ -82,6 +82,21 @@ class Environment(unittest.TestCase):
 
 
 class RolloutTests(Environment):
+    def test_current_subagent_metadata_does_not_trigger_root_notifications(self):
+        self.file = self.file.with_name("rollout-child.jsonl")
+        self.append(
+            "session_meta",
+            {
+                "id": "child-thread",
+                "source": {"subagent": {"thread_spawn": {"agent_path": "/root/child"}}},
+                "thread_source": "subagent",
+            },
+        )
+        self.append("event_msg", {"type": "task_started", "turn_id": "child-turn"})
+        self.append("event_msg", {"type": "task_complete", "turn_id": "child-turn"})
+        self.watcher.poll(self.now + 16)
+        self.assertEqual(self.store.recent(), [])
+
     def test_no_completion_from_inactivity(self):
         self.watcher.poll(self.now + 500)
         self.assertEqual(self.store.recent(), [])
@@ -327,6 +342,19 @@ class DeliveryTests(Environment):
             row = self.store.recent()[0]
             self.assertEqual(row["status"], "pending")
             self.assertEqual(row["attempts"], 1)
+        finally:
+            runner.stop()
+
+    def test_explicit_preview_plays_while_notifications_are_paused(self):
+        self.cfg["enabled"] = False
+        self.store.queue_test(self.now)
+        speech = FakeSpeech()
+        runner = Runner(self.cfg, self.store, harness=FakeHarness(), tts=speech)
+        try:
+            self.drain(runner)
+            self.assertEqual(speech.played, [b"test-audio"])
+            self.assertEqual(self.store.recent()[0]["kind"], "test")
+            self.assertEqual(self.store.recent()[0]["status"], "played")
         finally:
             runner.stop()
 

@@ -108,6 +108,8 @@ class Store:
         return event_id
 
     def valid(self, event):
+        if event["kind"] == "test":
+            return True
         body = json.loads(event["body"])
         t = self.thread(event["thread_id"])
         if event["kind"] in WAIT_KINDS:
@@ -120,14 +122,42 @@ class Store:
         # A subsequent user turn makes an earlier completion notification stale.
         return t.get("turn_id") == event["turn_id"] and t.get("status") == event["kind"]
 
-    def due(self, now, max_age, limit=5):
+    def queue_test(self, now=None):
+        import uuid
+
+        now = now or time.time()
+        key = uuid.uuid4().hex
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            pending = self.db.execute(
+                "SELECT id FROM events WHERE kind='test' AND status IN ('pending','preparing','synthesizing','playing') LIMIT 1"
+            ).fetchone()
+            if pending:
+                return pending[0]
+            return self.enqueue(
+                {
+                    "id": "manual-test",
+                    "turn_id": key,
+                    "title": "语音试听",
+                    "source": "settings",
+                },
+                "test",
+                key,
+                now,
+                evidence="用户主动点击了试听按钮，这是一条试听消息。",
+                summary="请用当前称呼简短问候用户，说明语音提醒已准备好。",
+            )
+
+    def due(self, now, max_age, limit=5, only_tests=False):
         with self.db:
             self.db.execute(
                 "UPDATE events SET status='expired' WHERE status='pending' AND created<? AND kind NOT IN ('waiting_on_user','waiting_on_approval')",
                 (now - max_age,),
             )
             rows = self.db.execute(
-                "SELECT * FROM events WHERE status='pending' AND due<=? ORDER BY CASE WHEN kind IN ('waiting_on_user','waiting_on_approval') THEN 0 ELSE 1 END,created LIMIT 100",
+                "SELECT * FROM events WHERE status='pending' AND due<=? "
+                + ("AND kind='test' " if only_tests else "")
+                + "ORDER BY CASE WHEN kind='test' THEN 0 WHEN kind IN ('waiting_on_user','waiting_on_approval') THEN 1 ELSE 2 END,created LIMIT 100",
                 (now,),
             ).fetchall()
             valid = []
@@ -139,7 +169,15 @@ class Store:
                     )
                 elif validity is True and len(valid) < limit:
                     valid.append(dict(row))
-            return valid
+            return (
+                [
+                    r
+                    for r in valid
+                    if (r["kind"] == "test") == (valid[0]["kind"] == "test")
+                ]
+                if valid
+                else []
+            )
 
     def transition(self, ids, status, **updates):
         allowed = {"attempts", "speech", "error", "due", "played_at"}

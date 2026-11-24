@@ -137,6 +137,7 @@ def fallback_text(events, call_name):
 
     title = redact(body["task_title"], 25)
     action = {
+        "test": "语音提醒已准备好，这是试听消息",
         "waiting_on_user": "需要你回答一个问题",
         "waiting_on_approval": "有操作需要你批准",
         "failed": "本轮执行失败，请查看原因",

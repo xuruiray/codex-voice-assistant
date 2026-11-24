@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .config import atomic_json, load
 from .daemon import DaemonWatcher
-from .harness import Harness
+from .composer import create_composer
 from .rollout import RolloutWatcher
 from .speech import VolcTTS, fallback_text
 from .store import Store
@@ -44,13 +44,24 @@ def fallback_beep():
 class Runner:
     def __init__(self, cfg, store, *, harness=None, tts=None):
         self.cfg, self.store = cfg, store
-        self.harness = harness or Harness(cfg)
+        self.harness = harness or create_composer(cfg)
+        self.provider = cfg["text_provider"]
         self.tts = tts or VolcTTS(cfg)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.future = None
         self.batch = None
         self.stage = None
         self.audio = None
+
+    def reconfigure(self, cfg):
+        self.cfg = self.tts.cfg = cfg
+        # A provider switch takes effect between notifications, never mid-request.
+        if self.provider != cfg["text_provider"]:
+            if self.future:
+                return
+            self.harness = create_composer(cfg)
+            self.provider = cfg["text_provider"]
+        self.harness.cfg = cfg
 
     def stop(self):
         cancel = getattr(self.harness, "cancel", None)
@@ -66,10 +77,13 @@ class Runner:
         now = now or time.time()
         if self.future and self.future.done():
             self.finish(now)
-        if self.future or not self.cfg["enabled"] or quiet_now(self.cfg):
+        if self.future:
             return
-        self.store.reminders(now, self.cfg["reminder_seconds"])
-        batch = self.store.due(now, self.cfg["max_age_seconds"])
+        self.reconfigure(self.cfg)
+        manual_only = not self.cfg["enabled"] or quiet_now(self.cfg)
+        if not manual_only:
+            self.store.reminders(now, self.cfg["reminder_seconds"])
+        batch = self.store.due(now, self.cfg["max_age_seconds"], only_tests=manual_only)
         if not batch:
             return
         self.batch = batch
@@ -112,8 +126,10 @@ class Runner:
                     self.store.transition(unknown, "pending", due=now + 30)
                 self.cleanup()
                 return
-            if self.stage != "play" and (
-                not self.cfg["enabled"] or quiet_now(self.cfg)
+            if (
+                self.stage != "play"
+                and (not self.cfg["enabled"] or quiet_now(self.cfg))
+                and not all(e["kind"] == "test" for e in self.batch)
             ):
                 self.store.transition(ids, "pending", due=now + 30)
                 self.cleanup()
@@ -183,6 +199,9 @@ def run(cfg, observe_only=False):
     store.recover()
     watcher, daemon = RolloutWatcher(store, cfg), DaemonWatcher(store, cfg)
     runner = Runner(cfg, store)
+    from .webui import UI
+
+    ui = UI(cfg).start()
     stopping = False
 
     def stop(*_):
@@ -196,8 +215,8 @@ def run(cfg, observe_only=False):
             tick = time.monotonic()
             try:
                 cfg = load(Path(cfg["config_path"]))
-                watcher.cfg = daemon.cfg = runner.cfg = cfg
-                runner.harness.cfg = runner.tts.cfg = cfg
+                watcher.cfg = daemon.cfg = cfg
+                runner.reconfigure(cfg)
                 watcher.poll()
                 daemon.poll()
                 if not observe_only:
@@ -213,6 +232,7 @@ def run(cfg, observe_only=False):
                         "daemon_loaded_threads": daemon.loaded_count,
                         "daemon_error": daemon.error,
                         "delivery_stage": runner.stage,
+                        "text_provider": runner.provider,
                         "desktop_approval_coverage": "unavailable: desktop does not expose pending approval flags to an independent observer",
                     },
                 )
@@ -223,6 +243,7 @@ def run(cfg, observe_only=False):
             while not stopping and time.monotonic() < deadline:
                 time.sleep(min(0.2, max(0, deadline - time.monotonic())))
     finally:
+        ui.close()
         runner.stop()
         daemon.close()
         store.close()

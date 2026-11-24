@@ -1,4 +1,4 @@
-"""Opt-in real DS/TTS smoke test through the production service entry point.
+"""Opt-in real model/TTS smoke test through the production service entry point.
 
 Uses a disposable Codex home, not the user's task files. The test speaks once.
 Run: .venv/bin/python tests/live_smoke.py
@@ -24,6 +24,7 @@ def main():
             **real,
             "state_dir": str(root / "state"),
             "codex_home": str(root / "codex"),
+            "codex_login_home": real["codex_login_home"] or real["codex_home"],
             "daemon_enabled": False,
             "poll_seconds": 0.25,
             "merge_seconds": 0,
@@ -96,7 +97,7 @@ def main():
                     )
                     if row[0] != "played" or row[2] is not None:
                         raise RuntimeError(
-                            "Live smoke did not complete through DeepSeek and TTS"
+                            "Live smoke did not complete through the selected model and TTS"
                         )
                     # A restart must not repeat an already played notification.
                     proc.send_signal(signal.SIGTERM)

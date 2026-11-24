@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-voice-assistant"
+version = "0.1.0"
+description = "Local Codex activity watcher with DeepSeek Harness and Volcengine speech"
+requires-python = ">=3.11"
+dependencies = ["websockets>=15,<16"]
+
+[project.scripts]
+codex-voice = "codex_voice.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codex_voice*"]
+
+[tool.setuptools.package-data]
+codex_voice = ["*.mjs"]
